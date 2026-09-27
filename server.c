@@ -53,6 +53,7 @@ static pthread_mutex_t send_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t stop_requested = 0;
 static volatile sig_atomic_t listening_socket_fd = -1;
 
+/* Fecha o socket de escuta para liberar o accept() durante o encerramento. */
 static void handle_shutdown_signal(int signal_number) {
     (void)signal_number;
     stop_requested = 1;
@@ -62,6 +63,7 @@ static void handle_shutdown_signal(int signal_number) {
     }
 }
 
+/* Garante o envio completo da mensagem, mesmo quando send() envia apenas parte dos bytes. */
 static int send_all(int socket_fd, const char *message) {
     size_t sent_total = 0;
     size_t message_length = strlen(message);
@@ -92,6 +94,7 @@ static int send_all(int socket_fd, const char *message) {
     return result;
 }
 
+/* Lê uma mensagem do protocolo até '\n' e descarta o restante caso ela ultrapasse o buffer. */
 static ssize_t receive_line(int socket_fd, char *buffer, size_t capacity) {
     size_t used = 0;
     int too_long = 0;
@@ -139,6 +142,7 @@ static ssize_t receive_line(int socket_fd, char *buffer, size_t capacity) {
     return (ssize_t)used;
 }
 
+/* Registra um usuário conectado. O mutex evita alterações simultâneas na tabela de clientes. */
 static int register_client(int socket_fd, const char *username) {
     int free_index = -1;
 
@@ -173,6 +177,7 @@ static int register_client(int socket_fd, const char *username) {
     return 0;
 }
 
+/* Remove o cliente da tabela quando a conexão é encerrada. */
 static void unregister_client(int socket_fd) {
     pthread_mutex_lock(&client_registry_mutex);
 
@@ -189,6 +194,7 @@ static void unregister_client(int socket_fd) {
     pthread_mutex_unlock(&client_registry_mutex);
 }
 
+/* Monta a lista de usuários enquanto o mutex impede alterações durante a leitura. */
 static int send_users(int socket_fd) {
     char response[USERS_RESPONSE_SIZE];
     size_t used = 0;
@@ -241,6 +247,7 @@ static int send_users(int socket_fd) {
     return send_all(socket_fd, response);
 }
 
+/* Converte o valor textual do lance e rejeita formatos inválidos ou valores não positivos. */
 static int parse_bid_amount(const char *text, long long *amount) {
     if (text == NULL || *text == '\0') {
         return -1;
@@ -258,6 +265,7 @@ static int parse_bid_amount(const char *text, long long *amount) {
     return 0;
 }
 
+/* Deve ser chamada com auction_mutex já adquirido para manter estado e histórico coerentes. */
 static void append_bid_history_locked(const char *username, long long amount) {
     if (auction_state.history_count == MAX_HISTORY) {
         memmove(
@@ -273,6 +281,7 @@ static void append_bid_history_locked(const char *username, long long amount) {
     record->amount = amount;
 }
 
+/* Copia o estado atual do leilão sob mutex antes de enviá-lo ao cliente. */
 static int send_auction_status(int socket_fd) {
     char response[BUFFER_SIZE];
 
@@ -294,6 +303,7 @@ static int send_auction_status(int socket_fd) {
     return send_all(socket_fd, response);
 }
 
+/* Serializa o histórico de lances aceitos no formato definido pelo protocolo. */
 static int send_bid_history(int socket_fd) {
     char response[BUFFER_SIZE];
     size_t used = 0;
@@ -342,6 +352,7 @@ static int send_bid_history(int socket_fd) {
     return send_all(socket_fd, response);
 }
 
+/* Notifica todos os clientes logados, exceto quem acabou de fazer o lance. */
 static void broadcast_new_bid(
     int source_socket_fd,
     long long amount,
@@ -396,7 +407,7 @@ static int process_bid(
 
     long long previous_bid;
 
-    /* Compare-and-update must be one critical section to avoid lost updates. */
+    /* A comparação e a atualização precisam ser atômicas para evitar race condition. */
     pthread_mutex_lock(&auction_mutex);
     previous_bid = auction_state.current_bid;
 
@@ -449,6 +460,7 @@ static int process_bid(
     return send_result;
 }
 
+/* Exibe o endereço IPv4 e a porta de origem de uma nova conexão. */
 static void print_client_address(const struct sockaddr_in *address) {
     char ip[INET_ADDRSTRLEN] = {0};
 
@@ -463,6 +475,7 @@ static void print_client_address(const struct sockaddr_in *address) {
     );
 }
 
+/* Processa os comandos de uma conexão até QUIT, erro ou desconexão. */
 static void handle_client(int client_fd) {
     char buffer[BUFFER_SIZE];
     char username[MAX_USERNAME_LENGTH + 1] = "";
@@ -577,7 +590,7 @@ static void handle_client(int client_fd) {
                 break;
             }
 
-            /* A newly logged-in client immediately receives current auction state. */
+            /* Após o login, o cliente já recebe o estado atual do leilão. */
             if (send_auction_status(client_fd) < 0) {
                 break;
             }
@@ -661,7 +674,7 @@ static void handle_client(int client_fd) {
 }
 
 static void *client_thread(void *argument) {
-    /* Each thread owns its client descriptor and releases it on exit. */
+    /* Cada thread assume a responsabilidade pelo descritor recebido. */
     int client_fd = *(int *)argument;
     free(argument);
 
@@ -674,7 +687,7 @@ static void *client_thread(void *argument) {
 int main(int argc, char *argv[]) {
     int port = DEFAULT_PORT;
 
-    /* A disconnected peer must not terminate the whole server during send(). */
+    /* Um cliente desconectado não deve encerrar o servidor durante send(). */
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_shutdown_signal);
     signal(SIGTERM, handle_shutdown_signal);
@@ -759,7 +772,7 @@ int main(int argc, char *argv[]) {
 
         print_client_address(&client_address);
 
-        /* The descriptor is allocated because the thread may outlive this loop iteration. */
+        /* O descritor é alocado porque a thread pode continuar após esta iteração do laço. */
         int *thread_client_fd = malloc(sizeof(*thread_client_fd));
         if (thread_client_fd == NULL) {
             perror("malloc");
@@ -788,7 +801,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        /* Detached threads release their own pthread resources when they finish. */
+        /* A thread é detached porque o servidor não precisa fazer join depois. */
         thread_error = pthread_detach(thread_id);
         if (thread_error != 0) {
             fprintf(

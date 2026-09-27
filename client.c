@@ -15,6 +15,7 @@ typedef struct {
     int socket_fd;
 } ReceiverArgs;
 
+/* Envia a mensagem inteira, tratando envios parciais de send(). */
 static int send_all(int socket_fd, const char *message) {
     size_t sent_total = 0;
     size_t message_length = strlen(message);
@@ -40,6 +41,7 @@ static int send_all(int socket_fd, const char *message) {
     return 0;
 }
 
+/* Lê uma resposta completa do servidor até a quebra de linha do protocolo. */
 static ssize_t receive_line(int socket_fd, char *buffer, size_t capacity) {
     size_t used = 0;
 
@@ -75,6 +77,7 @@ static ssize_t receive_line(int socket_fd, char *buffer, size_t capacity) {
     return (ssize_t)used;
 }
 
+/* Mantém a recepção independente da entrada do usuário para permitir eventos assíncronos. */
 static void *receiver_thread(void *argument) {
     ReceiverArgs *args = argument;
     char response[BUFFER_SIZE];
@@ -110,6 +113,7 @@ static void *receiver_thread(void *argument) {
     return NULL;
 }
 
+/* Configura a conexão e mantém a thread principal dedicada ao envio de comandos. */
 int main(int argc, char *argv[]) {
     const char *server_ip = "127.0.0.1";
     int port = DEFAULT_PORT;
@@ -164,6 +168,7 @@ int main(int argc, char *argv[]) {
         .socket_fd = socket_fd
     };
 
+    /* A thread receptora permite receber broadcasts enquanto o usuário digita. */
     pthread_t receiver_id;
     int thread_error = pthread_create(
         &receiver_id,
@@ -199,6 +204,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
+        /* Se fgets() não capturou '\n', a linha ultrapassou o espaço disponível. */
         if (input[length - 1] != '\n') {
             if (length + 1 >= sizeof(input)) {
                 fprintf(stderr, "[CLIENT] Command too long.\n");
