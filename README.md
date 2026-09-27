@@ -4,7 +4,7 @@
 
 **Instituição:** Universidade de São Paulo (USP) — Instituto de Ciências Matemáticas e de Computação (ICMC)
 
-**Curso:** Bacharelado em Ciência da Computação
+**Curso:** Engenharia de Computação
 
 **Disciplina:** Redes de Computadores
 
@@ -14,11 +14,11 @@
 
 ## Integrantes
 
-- Ana Luiza Kodama
-- Ana Beatriz — sobrenome completo a confirmar
-- Isabela — sobrenome completo a confirmar
+- **Ana Luíza Lasta Kodama** — NUSP 14651204
+- **Ana Beatriz** — sobrenome completo e NUSP a confirmar
+- **Isabela Lima Silva** — NUSP 15678780
 
-> Os sobrenomes completos de Ana Beatriz e Isabela serão adicionados antes da entrega final.
+> Os dados completos de Ana Beatriz serão adicionados antes da entrega final.
 
 ---
 
@@ -617,4 +617,4 @@ Durante a demonstração é possível mostrar:
 - [x] Makefile
 - [x] Documentação
 
-O projeto encontra-se funcional e pronto para demonstração, restando apenas completar os sobrenomes dos integrantes antes da entrega final.
+O projeto encontra-se funcional e pronto para demonstração, restando apenas completar o sobrenome e o NUSP de Ana Beatriz antes da entrega final.
