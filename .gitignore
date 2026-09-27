@@ -1,0 +1,8 @@
+server
+client
+*.o
+*.out
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
