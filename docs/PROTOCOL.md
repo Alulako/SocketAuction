@@ -1,65 +1,60 @@
-# Protocol — SocketAuction
+# Protocolo de aplicação
 
-TCP is a byte stream, so the application must define message boundaries. SocketAuction uses one UTF-8/text command per line, terminated by `\n`. Fields are separated by `|`.
+O SocketAuction usa TCP/IPv4. Como TCP transporta um fluxo de bytes, cada comando e resposta deve terminar com `\n`. Os campos são separados por `|`.
 
-## Client -> server
+O servidor aceita até 2047 caracteres de conteúdo por linha, sem contar o terminador. Uma linha maior recebe `ERROR|MESSAGE_TOO_LONG|Command exceeds maximum size`, desde que seja encerrada corretamente com `\n`. Uma conexão encerrada antes do terminador não executa o comando incompleto.
 
-```text
-LOGIN|<name>
-STATUS
-BID|<amount>
-USERS
-HISTORY
-PING
-QUIT
-```
+## Comandos enviados pelo cliente
 
-Examples:
+| Comando | Descrição | Login exigido |
+|---|---|---|
+| `LOGIN|nome` | Registra o nome de usuário na conexão. | Não |
+| `STATUS` | Consulta o item, maior lance e ofertante. | Não |
+| `BID|valor` | Envia um lance inteiro positivo. | Sim |
+| `USERS` | Consulta os usuários autenticados. | Sim |
+| `HISTORY` | Consulta os últimos 32 lances aceitos. | Sim |
+| `PING` | Verifica a comunicação. | Não |
+| `QUIT` | Encerra a sessão. | Não |
 
-```text
-LOGIN|Ana
-BID|2500
-```
+O nome de usuário deve ter entre 1 e 31 caracteres e não pode conter `|`. Dois clientes não podem usar o mesmo nome simultaneamente. Um cliente já autenticado não pode trocar de nome durante a conexão.
 
-## Server -> client
+## Respostas e eventos do servidor
 
 ```text
-OK|LOGIN|<name>
-USERS|<count>|<user1>|<user2>|...
-HISTORY|<count>|<user1>|<amount1>|<user2>|<amount2>|...
-AUCTION|<item>|<highest_bid>|<highest_bidder>
-BID_ACCEPTED|<amount>|<user>
-BID_REJECTED|<reason>
-EVENT|NEW_BID|<amount>|<user>
-ERROR|<code>|<message>
+OK|LOGIN|Ana
+AUCTION|Notebook|1000|NONE
+BID_ACCEPTED|1500|Ana
+BID_REJECTED|Bid must be greater than 1500
+USERS|2|Ana|Joao
+HISTORY|2|Ana|1500|Joao|1800
+EVENT|NEW_BID|1800|Joao
+ERROR|NOT_LOGGED_IN|Login required
 PONG
 BYE
 ```
 
-## Login and user-registry rules
+Após confirmar um login, o servidor envia também o estado atual do leilão. Cada lance aceito é confirmado ao próprio ofertante; os demais usuários autenticados recebem um evento assíncrono de novo lance.
 
-- `LOGIN` registers the connection in the server's shared user registry;
-- usernames must be non-empty, at most 31 characters, and cannot contain `|`;
-- two simultaneously connected clients cannot use the same username;
-- a connection cannot change username after a successful login;
-- `USERS` requires login and returns a snapshot of logged-in users;
-- `HISTORY` requires login and returns accepted bids in chronological order;
-- the server removes a logged-in user on `QUIT` or connection loss;
-- the registry is protected with a dedicated mutex because multiple client threads access it concurrently.
+Os eventos de lances aceitos são enviados na ordem em que os lances são registrados. O cliente pode receber um evento enquanto aguarda uma resposta a outro comando.
 
-## Auction rules
+## Regras do leilão
 
-- a client must log in before bidding;
-- `BID|<amount>` accepts positive integer values only;
-- a bid must be strictly greater than the current bid;
-- an accepted bid updates both the current value and highest bidder;
-- `STATUS` returns the current shared auction state;
-- the server is the only source of truth for auction state;
-- clients only update their displayed state after a server response/event;
-- malformed or unknown commands return an error instead of crashing the server;
-- commands larger than the receive buffer are drained completely and return `ERROR|MESSAGE_TOO_LONG|Command exceeds maximum size`, preserving framing for the next command;
-- after a bid is accepted, the bidder receives `BID_ACCEPTED|<amount>|<user>`;
-- every other logged-in client receives `EVENT|NEW_BID|<amount>|<user>` asynchronously;
-- clients do not need to send `STATUS` to learn about a new accepted bid;
-- immediately after a successful login, the server sends the current `AUCTION|...` state automatically;
-- the server keeps the 32 most recent accepted bids; rejected bids never enter history.
+- O valor inicial é 1000 e o item é `Notebook`.
+- Um novo lance deve ser inteiro, positivo e estritamente maior que o lance registrado no momento do processamento.
+- A comparação, a atualização do valor e o registro no histórico são sincronizados.
+- Lances rejeitados não aparecem no histórico.
+- O histórico mantém apenas os 32 lances aceitos mais recentes.
+- Os valores são inteiros para simplificar a demonstração; o sistema não efetua transações financeiras reais.
+
+## Casos de erro
+
+- Nome inválido: `ERROR|INVALID_LOGIN|Invalid username`.
+- Nome já utilizado: `ERROR|USERNAME_IN_USE|Username already connected`.
+- Segundo login na mesma conexão: `ERROR|ALREADY_LOGGED_IN|Client already logged in`.
+- Operação que exige login: `ERROR|NOT_LOGGED_IN|Login required`.
+- Valor de lance malformado: `BID_REJECTED|Invalid bid amount`.
+- Comando desconhecido: `ERROR|UNKNOWN_COMMAND|Unknown command`.
+- Linha vazia: `ERROR|EMPTY_COMMAND|Empty command`.
+- Mensagem longa demais: `ERROR|MESSAGE_TOO_LONG|Command exceeds maximum size`.
+
+Uma linha incompleta seguida de EOF é descartada, sem gerar resposta. Em caso de desconexão, o servidor libera o usuário da tabela de logins.

@@ -1,93 +1,63 @@
-# Architecture — SocketAuction
+# Arquitetura do SocketAuction
 
-## Goal
+## Visão geral
 
-Build a real-time auction system in C using TCP sockets and POSIX threads, with multiple clients connected simultaneously.
-
-## Overview
+O SocketAuction usa TCP/IPv4 e arquitetura cliente-servidor. O servidor mantém um leilão único em memória e cria uma thread POSIX para cada conexão. O cliente usa uma thread para ler comandos e outra para receber respostas e eventos enviados pelo servidor.
 
 ```text
-client.c -- TCP --> server.c
-                     |-- client thread 1
-                     |-- client thread 2
-                     |-- client thread 3
-                     `-- shared auction state
+Cliente Ana ---- TCP ----+
+                         |
+Cliente João --- TCP ----+---- Servidor
+                         |       |-- uma thread por conexão
+Cliente Bia ---- TCP ----+       |-- registro de usuários
+                                 |-- estado e histórico do leilão
+                                 +-- notificações para outros clientes
 ```
 
-## Client responsibilities
+## Conexões e encerramento
 
-- connect to the server IP/port;
-- identify the user with `LOGIN`;
-- send protocol commands from the main thread;
-- run a dedicated receiver thread;
-- display normal responses and asynchronous events while the user can continue typing.
+O servidor abre um socket de escuta com `socket()`, `bind()` e `listen()`. Um laço com `poll()` verifica periodicamente se foi pedido o encerramento e chama `accept()` quando há novas conexões.
 
-## Server responsibilities
+Cada conexão aceita é registrada na lista de sessões ativas antes da criação da thread. Essa lista abrange inclusive clientes que ainda não fizeram login. A thread remove sua sessão e fecha o socket ao terminar.
 
-- create and configure the TCP socket;
-- accept connections;
-- create one thread per client;
-- validate commands;
-- maintain shared auction state;
-- protect shared state with a mutex;
-- broadcast accepted bids;
-- detect disconnects and release resources.
+Ao receber `SIGINT` ou `SIGTERM`, o servidor para de aceitar conexões, fecha o socket de escuta, chama `shutdown()` nas sessões ativas e aguarda que todas sejam removidas antes de encerrar. Os clientes percebem o fechamento da conexão e encerram mesmo sem digitar `QUIT`.
 
-## Shared state
+## Protocolo
 
-```text
-AuctionState                 (implemented in M4)
-- item
-- current_bid
-- highest_bidder
-- dedicated mutex
+As mensagens são linhas de texto finalizadas com `\n`. O servidor só processa um comando depois de receber o terminador. Se ocorrer EOF antes disso, a linha parcial é descartada. Mensagens acima do limite são drenadas até o terminador, evitando interpretar fragmentos como novos comandos.
 
-ClientRegistry               (implemented in M3)
-- active entries
-- socket descriptor
-- username
-- dedicated mutex
+O servidor é a única fonte de verdade para o estado do leilão.
 
-BidHistory                   (implemented in M7)
-- last 32 accepted bids
-- username
-- amount
-- chronological order
-```
+## Concorrência
 
-## Concurrency rules
+São usadas travas distintas, com responsabilidades definidas:
 
-The user registry is shared by all server-side client threads, so register, unregister and user-list snapshots use a dedicated mutex.
+| Trava | Responsabilidade |
+|---|---|
+| `auction_mutex` | Protege o maior lance, o ofertante e o histórico. |
+| `client_registry_mutex` | Protege a tabela de usuários autenticados. |
+| `client_send_mutexes` | Serializa respostas e eventos enviados a cada cliente, sem um bloqueio global para todos os sockets. |
+| `bid_order_mutex` | Mantém a ordem entre aceitar um lance e transmitir sua notificação. |
+| `sessions_mutex` | Protege a lista de todas as conexões ativas durante a execução e o encerramento. |
 
-The auction uses a separate mutex around the entire compare-and-update sequence. This prevents a race in which two client threads read the same old bid and then overwrite each other. M5 stress-tests this critical section with 20 bidders in the same time window for 5 consecutive rounds.
+A comparação do novo valor e a atualização do maior lance e do histórico acontecem na mesma seção crítica. Durante o broadcast, o servidor duplica os descritores dos clientes autenticados enquanto consulta a tabela e a libera antes de enviar os dados. Isso evita manter o registro global bloqueado enquanto espera respostas da rede.
 
-M6 adds asynchronous server-to-client traffic. A send mutex serializes writes so a direct response and a broadcast cannot interleave bytes on the same TCP stream. The client now has a dedicated receiver thread, allowing events to appear even when the user has not typed a new command.
+O envio por conexão possui tempo máximo configurado de 500 ms por chamada bloqueante de `send()`. Um cliente muito lento ainda pode atrasar temporariamente a sequência de notificações; esse limite evita uma espera indefinida. Em caso de falha no envio de um evento, a conexão problemática é encerrada.
 
-M7 stores accepted bids inside the auction state while the auction mutex is held, so the visible highest bid and history are updated consistently. New clients also receive the current auction state immediately after login.
+## Fluxo de um lance
 
-M8 hardens protocol framing and process lifecycle: oversized lines are completely drained before the next command is parsed, disconnected peers cannot terminate the server through `SIGPIPE`, and termination signals close the listening socket cleanly. The final `make test-all` suite runs concurrency, broadcast, history and robustness regressions.
+1. A thread do cliente recebe `BID|valor`.
+2. O valor e o login são validados.
+3. O servidor serializa a operação de lance com `bid_order_mutex`.
+4. Sob `auction_mutex`, compara o valor, atualiza o estado e registra o histórico.
+5. Envia `BID_ACCEPTED` ao ofertante ou `BID_REJECTED` quando necessário.
+6. Para lances aceitos, notifica os outros clientes com `EVENT|NEW_BID`.
 
-## Initial technical decisions
+## Limites e escopo
 
-- transport: TCP;
-- application framing: one textual message per line;
-- field separator: `|`;
-- default port: 8080;
-- maximum initial message size: 512 bytes;
-- language: C11;
-- target: Linux + GCC.
-
-## Thread lifecycle in M2
-
-For every successful `accept`, the server allocates storage for the client socket descriptor, starts a `pthread`, and immediately detaches it. The worker thread owns that descriptor, runs the existing client handler, closes the socket, and then exits. This lets the main thread return to `accept` immediately and serve other clients concurrently.
-
-## Milestones
-
-1. M1 — basic TCP connection and request/response. ✅
-2. M2 — multiple clients using `pthread`. ✅
-3. M3 — login and connected-user registry. ✅
-4. M4 — bids and validation. ✅
-5. M5 — simultaneous-bid concurrency stress tests. ✅
-6. M6 — broadcast new bids. ✅
-7. M7 — bid history and refinements. ✅
-8. M8 — failure handling and final tests. ✅
+- Uma instância do servidor mantém um leilão em memória.
+- O item inicial é `Notebook`, com lance inicial `1000`.
+- O registro comporta até 32 usuários autenticados.
+- São mantidos os 32 lances aceitos mais recentes.
+- Não há banco de dados, pagamentos ou persistência após reiniciar o servidor.
+- O projeto foi pensado para ambiente Linux e utiliza C11, POSIX Threads e sockets do sistema.

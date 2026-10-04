@@ -1,12 +1,14 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <pthread.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #define DEFAULT_PORT 8080
@@ -18,12 +20,23 @@
 #define MAX_HISTORY 32
 #define USERS_RESPONSE_SIZE 2048
 #define RECEIVE_TOO_LONG (-2)
+#define RECEIVE_DISCONNECTED (-3)
 
 typedef struct {
     int active;
     int socket_fd;
     char username[MAX_USERNAME_LENGTH + 1];
 } ClientEntry;
+
+typedef struct SessionNode {
+    int socket_fd;
+    struct SessionNode *next;
+} SessionNode;
+
+typedef struct {
+    int socket_fd;
+    int registry_slot;
+} Recipient;
 
 typedef struct {
     char username[MAX_USERNAME_LENGTH + 1];
@@ -40,6 +53,10 @@ typedef struct {
 
 static ClientEntry client_registry[MAX_CLIENTS];
 static pthread_mutex_t client_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t client_send_mutexes[MAX_CLIENTS];
+static SessionNode *active_sessions = NULL;
+static pthread_mutex_t sessions_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sessions_empty = PTHREAD_COND_INITIALIZER;
 
 static AuctionState auction_state = {
     .item = "Notebook",
@@ -48,29 +65,19 @@ static AuctionState auction_state = {
     .history_count = 0
 };
 static pthread_mutex_t auction_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t send_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t bid_order_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static volatile sig_atomic_t stop_requested = 0;
-static volatile sig_atomic_t listening_socket_fd = -1;
-
-/* Fecha o socket de escuta para liberar o accept() durante o encerramento. */
+/* O laço principal consulta esta variável e fecha os sockets fora do handler. */
 static void handle_shutdown_signal(int signal_number) {
     (void)signal_number;
     stop_requested = 1;
-
-    if (listening_socket_fd >= 0) {
-        close((int)listening_socket_fd);
-    }
 }
 
-/* Garante o envio completo da mensagem, mesmo quando send() envia apenas parte dos bytes. */
-static int send_all(int socket_fd, const char *message) {
+/* Envia todos os bytes; o bloqueio do socket é feito pela função chamadora. */
+static int send_raw(int socket_fd, const char *message) {
     size_t sent_total = 0;
     size_t message_length = strlen(message);
-    int result = 0;
-
-    pthread_mutex_lock(&send_mutex);
-
     while (sent_total < message_length) {
         ssize_t sent = send(
             socket_fd,
@@ -83,14 +90,37 @@ static int send_all(int socket_fd, const char *message) {
             if (errno == EINTR) {
                 continue;
             }
-            result = -1;
-            break;
+            return -1;
+        }
+        if (sent == 0) {
+            return -1;
         }
 
         sent_total += (size_t)sent;
     }
 
-    pthread_mutex_unlock(&send_mutex);
+    return 0;
+}
+
+/* Cada conexão tem sua própria trava de envio; clientes diferentes não se bloqueiam. */
+static int send_all(int socket_fd, const char *message) {
+    int slot = -1;
+
+    pthread_mutex_lock(&client_registry_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (client_registry[i].active &&
+            client_registry[i].socket_fd == socket_fd) {
+            slot = i;
+            pthread_mutex_lock(&client_send_mutexes[slot]);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&client_registry_mutex);
+
+    int result = send_raw(socket_fd, message);
+    if (slot >= 0) {
+        pthread_mutex_unlock(&client_send_mutexes[slot]);
+    }
     return result;
 }
 
@@ -98,6 +128,7 @@ static int send_all(int socket_fd, const char *message) {
 static ssize_t receive_line(int socket_fd, char *buffer, size_t capacity) {
     size_t used = 0;
     int too_long = 0;
+    int complete = 0;
 
     if (capacity == 0) {
         return -1;
@@ -119,6 +150,7 @@ static ssize_t receive_line(int socket_fd, char *buffer, size_t capacity) {
         }
 
         if (ch == '\n') {
+            complete = 1;
             break;
         }
 
@@ -135,6 +167,10 @@ static ssize_t receive_line(int socket_fd, char *buffer, size_t capacity) {
 
     buffer[used] = '\0';
 
+    /* EOF antes de '\n' não forma um comando válido. */
+    if (!complete) {
+        return RECEIVE_DISCONNECTED;
+    }
     if (too_long) {
         return RECEIVE_TOO_LONG;
     }
@@ -371,24 +407,37 @@ static void broadcast_new_bid(
         return;
     }
 
-    pthread_mutex_lock(&client_registry_mutex);
+    Recipient recipients[MAX_CLIENTS];
+    int count = 0;
 
+    /* dup() mantém cada conexão válida mesmo se o cliente sair durante o envio. */
+    pthread_mutex_lock(&client_registry_mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!client_registry[i].active ||
             client_registry[i].socket_fd == source_socket_fd) {
             continue;
         }
 
-        if (send_all(client_registry[i].socket_fd, event) < 0) {
-            fprintf(
-                stderr,
-                "[BROADCAST] Failed to notify %s.\n",
-                client_registry[i].username
-            );
+        int copy = dup(client_registry[i].socket_fd);
+        if (copy < 0) {
+            perror("[BROADCAST] dup");
+            continue;
         }
+        recipients[count++] = (Recipient){ .socket_fd = copy, .registry_slot = i };
     }
-
     pthread_mutex_unlock(&client_registry_mutex);
+
+    for (int i = 0; i < count; i++) {
+        int slot = recipients[i].registry_slot;
+        pthread_mutex_lock(&client_send_mutexes[slot]);
+        if (send_raw(recipients[i].socket_fd, event) < 0) {
+            perror("[BROADCAST] send");
+            /* Avisa o worker para liberar uma conexão que deixou de receber. */
+            shutdown(recipients[i].socket_fd, SHUT_RDWR);
+        }
+        pthread_mutex_unlock(&client_send_mutexes[slot]);
+        close(recipients[i].socket_fd);
+    }
 }
 
 static int process_bid(
@@ -407,12 +456,14 @@ static int process_bid(
 
     long long previous_bid;
 
-    /* A comparação e a atualização precisam ser atômicas para evitar race condition. */
+    /* Mantém a ordem das notificações igual à ordem dos lances aceitos. */
+    pthread_mutex_lock(&bid_order_mutex);
     pthread_mutex_lock(&auction_mutex);
     previous_bid = auction_state.current_bid;
 
     if (amount <= auction_state.current_bid) {
         pthread_mutex_unlock(&auction_mutex);
+        pthread_mutex_unlock(&bid_order_mutex);
 
         char response[BUFFER_SIZE];
         int written = snprintf(
@@ -456,6 +507,7 @@ static int process_bid(
 
     int send_result = send_all(socket_fd, response);
     broadcast_new_bid(socket_fd, amount, username);
+    pthread_mutex_unlock(&bid_order_mutex);
 
     return send_result;
 }
@@ -494,14 +546,21 @@ static void handle_client(int client_fd) {
             continue;
         }
 
+        if (received == RECEIVE_DISCONNECTED) {
+            printf("[SERVER] Client disconnected.\n");
+            break;
+        }
         if (received < 0) {
             perror("[SERVER] recv");
             break;
         }
-
         if (received == 0) {
-            printf("[SERVER] Client disconnected.\n");
-            break;
+            if (send_all(
+                    client_fd, "ERROR|EMPTY_COMMAND|Empty command\n"
+                ) < 0) {
+                break;
+            }
+            continue;
         }
 
         printf("[RECV] %s\n", buffer);
@@ -674,13 +733,22 @@ static void handle_client(int client_fd) {
 }
 
 static void *client_thread(void *argument) {
-    /* Cada thread assume a responsabilidade pelo descritor recebido. */
-    int client_fd = *(int *)argument;
-    free(argument);
+    SessionNode *session = argument;
+    handle_client(session->socket_fd);
 
-    handle_client(client_fd);
-    close(client_fd);
-
+    /* Fecha e remove o socket sob a mesma trava usada pelo encerramento geral. */
+    pthread_mutex_lock(&sessions_mutex);
+    SessionNode **current = &active_sessions;
+    while (*current != session) {
+        current = &(*current)->next;
+    }
+    *current = session->next;
+    close(session->socket_fd);
+    free(session);
+    if (active_sessions == NULL) {
+        pthread_cond_signal(&sessions_empty);
+    }
+    pthread_mutex_unlock(&sessions_mutex);
     return NULL;
 }
 
@@ -701,13 +769,19 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        int error = pthread_mutex_init(&client_send_mutexes[i], NULL);
+        if (error != 0) {
+            fprintf(stderr, "pthread_mutex_init: %s\n", strerror(error));
+            return EXIT_FAILURE;
+        }
+    }
+
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");
         return EXIT_FAILURE;
     }
-
-    listening_socket_fd = server_fd;
 
     int reuse = 1;
     if (setsockopt(
@@ -745,9 +819,25 @@ int main(int argc, char *argv[]) {
     }
 
     printf("[SERVER] SocketAuction listening on port %d.\n", port);
-    printf("[SERVER] M8: hardened protocol and graceful shutdown enabled.\n");
+    printf("[SERVER] Ready to accept connections.\n");
 
-    for (;;) {
+    while (!stop_requested) {
+        struct pollfd listener = { .fd = server_fd, .events = POLLIN };
+        int ready = poll(&listener, 1, 200);
+        if (stop_requested) {
+            break;
+        }
+        if (ready == 0 || (ready < 0 && errno == EINTR)) {
+            continue;
+        }
+        if (ready < 0 || (listener.revents & (POLLERR | POLLNVAL))) {
+            perror("[SERVER] poll");
+            break;
+        }
+        if (!(listener.revents & POLLIN)) {
+            continue;
+        }
+
         struct sockaddr_in client_address;
         socklen_t client_length = sizeof(client_address);
 
@@ -770,52 +860,66 @@ int main(int argc, char *argv[]) {
             break;
         }
 
+        if (stop_requested) {
+            close(client_fd);
+            break;
+        }
         print_client_address(&client_address);
 
-        /* O descritor é alocado porque a thread pode continuar após esta iteração do laço. */
-        int *thread_client_fd = malloc(sizeof(*thread_client_fd));
-        if (thread_client_fd == NULL) {
+        /* Um cliente sem leitura não pode manter um envio bloqueado indefinidamente. */
+        struct timeval send_timeout = { .tv_sec = 0, .tv_usec = 500000 };
+        if (setsockopt(
+                client_fd, SOL_SOCKET, SO_SNDTIMEO,
+                &send_timeout, sizeof(send_timeout)
+            ) < 0) {
+            perror("[SERVER] setsockopt SO_SNDTIMEO");
+            close(client_fd);
+            continue;
+        }
+
+        SessionNode *session = malloc(sizeof(*session));
+        if (session == NULL) {
             perror("malloc");
             close(client_fd);
             continue;
         }
+        session->socket_fd = client_fd;
 
-        *thread_client_fd = client_fd;
+        pthread_mutex_lock(&sessions_mutex);
+        session->next = active_sessions;
+        active_sessions = session;
+        pthread_mutex_unlock(&sessions_mutex);
 
         pthread_t thread_id;
-        int thread_error = pthread_create(
-            &thread_id,
-            NULL,
-            client_thread,
-            thread_client_fd
-        );
-
+        int thread_error = pthread_create(&thread_id, NULL, client_thread, session);
         if (thread_error != 0) {
-            fprintf(
-                stderr,
-                "[SERVER] pthread_create failed: %s\n",
-                strerror(thread_error)
-            );
-            free(thread_client_fd);
+            fprintf(stderr, "[SERVER] pthread_create: %s\n", strerror(thread_error));
+            pthread_mutex_lock(&sessions_mutex);
+            active_sessions = session->next;
+            pthread_mutex_unlock(&sessions_mutex);
             close(client_fd);
+            free(session);
             continue;
         }
 
-        /* A thread é detached porque o servidor não precisa fazer join depois. */
+        /* O laço principal aguarda as sessões ativas antes de encerrar. */
         thread_error = pthread_detach(thread_id);
         if (thread_error != 0) {
-            fprintf(
-                stderr,
-                "[SERVER] pthread_detach failed: %s\n",
-                strerror(thread_error)
-            );
+            fprintf(stderr, "[SERVER] pthread_detach: %s\n", strerror(thread_error));
         }
     }
 
-    if (!stop_requested) {
-        close(server_fd);
+    close(server_fd);
+
+    pthread_mutex_lock(&sessions_mutex);
+    for (SessionNode *session = active_sessions;
+         session != NULL; session = session->next) {
+        shutdown(session->socket_fd, SHUT_RDWR);
     }
-    listening_socket_fd = -1;
+    while (active_sessions != NULL) {
+        pthread_cond_wait(&sessions_empty, &sessions_mutex);
+    }
+    pthread_mutex_unlock(&sessions_mutex);
 
     printf("[SERVER] Shutdown complete.\n");
     return EXIT_SUCCESS;

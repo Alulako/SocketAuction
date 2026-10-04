@@ -1,6 +1,10 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <pthread.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +17,7 @@
 
 typedef struct {
     int socket_fd;
+    atomic_bool finished;
 } ReceiverArgs;
 
 /* Envia a mensagem inteira, tratando envios parciais de send(). */
@@ -34,6 +39,9 @@ static int send_all(int socket_fd, const char *message) {
             }
             return -1;
         }
+        if (sent == 0) {
+            return -1;
+        }
 
         sent_total += (size_t)sent;
     }
@@ -44,6 +52,7 @@ static int send_all(int socket_fd, const char *message) {
 /* Lê uma resposta completa do servidor até a quebra de linha do protocolo. */
 static ssize_t receive_line(int socket_fd, char *buffer, size_t capacity) {
     size_t used = 0;
+    int complete = 0;
 
     if (capacity == 0) {
         return -1;
@@ -65,6 +74,7 @@ static ssize_t receive_line(int socket_fd, char *buffer, size_t capacity) {
         }
 
         if (ch == '\n') {
+            complete = 1;
             break;
         }
 
@@ -74,7 +84,7 @@ static ssize_t receive_line(int socket_fd, char *buffer, size_t capacity) {
     }
 
     buffer[used] = '\0';
-    return (ssize_t)used;
+    return complete ? (ssize_t)used : 0;
 }
 
 /* Mantém a recepção independente da entrada do usuário para permitir eventos assíncronos. */
@@ -110,11 +120,13 @@ static void *receiver_thread(void *argument) {
         fflush(stdout);
     }
 
+    atomic_store(&args->finished, 1);
     return NULL;
 }
 
 /* Configura a conexão e mantém a thread principal dedicada ao envio de comandos. */
 int main(int argc, char *argv[]) {
+    signal(SIGPIPE, SIG_IGN);
     const char *server_ip = "127.0.0.1";
     int port = DEFAULT_PORT;
 
@@ -165,7 +177,8 @@ int main(int argc, char *argv[]) {
     );
 
     ReceiverArgs receiver_args = {
-        .socket_fd = socket_fd
+        .socket_fd = socket_fd,
+        .finished = ATOMIC_VAR_INIT(0)
     };
 
     /* A thread receptora permite receber broadcasts enquanto o usuário digita. */
@@ -187,12 +200,36 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    /* Evita que fgets() guarde linhas que poll() ainda não consegue observar. */
+    setvbuf(stdin, NULL, _IONBF, 0);
     char input[BUFFER_SIZE];
 
     for (;;) {
+        if (atomic_load(&receiver_args.finished)) {
+            break;
+        }
+
         printf("> ");
         fflush(stdout);
 
+        /* poll evita ficar preso em fgets() após o encerramento do servidor. */
+        struct pollfd input_poll = { .fd = STDIN_FILENO, .events = POLLIN };
+        int ready;
+        do {
+            ready = poll(&input_poll, 1, 200);
+        } while (ready == 0 && !atomic_load(&receiver_args.finished));
+
+        if (atomic_load(&receiver_args.finished)) {
+            break;
+        }
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("[CLIENT] poll");
+            shutdown(socket_fd, SHUT_RDWR);
+            break;
+        }
         if (fgets(input, sizeof(input), stdin) == NULL) {
             printf("\n[CLIENT] Input closed.\n");
             shutdown(socket_fd, SHUT_WR);

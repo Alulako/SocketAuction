@@ -18,7 +18,7 @@
 - **Ana Beatriz** — sobrenome completo e NUSP a confirmar
 - **Isabela Lima Silva** — NUSP 15678780
 
-> Os dados completos de Ana Beatriz serão adicionados antes da entrega final.
+> **Pendente antes da entrega:** confirmar e preencher o sobrenome completo e o NUSP de Ana Beatriz.
 
 ---
 
@@ -66,7 +66,8 @@ O sistema atualmente oferece:
 - remoção automática de usuários desconectados;
 - tratamento de comandos desconhecidos;
 - tratamento de mensagens maiores que o limite do protocolo;
-- encerramento controlado do servidor com `SIGINT` ou `SIGTERM`;
+- encerramento coordenado: o servidor fecha as sessões ativas e aguarda sua liberação ao receber `SIGINT` ou `SIGTERM`;
+- encerramento automático do cliente quando a conexão com o servidor é fechada;
 - testes automatizados de concorrência, broadcast, histórico e robustez.
 
 O item inicial configurado para demonstração é:
@@ -76,6 +77,8 @@ Item: Notebook
 Lance inicial: 1000
 Maior ofertante: NONE
 ```
+
+**Escopo acadêmico:** a aplicação gerencia um único leilão em memória; os dados não persistem após reiniciar o servidor. O login identifica os participantes, mas não utiliza senhas, criptografia ou autenticação forte. O sistema não processa pagamentos e não deve ser exposto à Internet como serviço comercial.
 
 ---
 
@@ -149,7 +152,7 @@ Foi utilizado **TCP (Transmission Control Protocol)** porque o sistema precisa d
 - orientada à conexão;
 - confiável;
 - ordenada;
-- sem perda silenciosa de mensagens da aplicação.
+- retransmissão e controle de entrega enquanto a conexão permanece operacional.
 
 Em um leilão, a ordem dos lances é importante. O servidor precisa receber os dados corretamente e manter uma visão consistente do maior lance registrado.
 
@@ -185,7 +188,9 @@ unlock(mutex)
 
 Sem essa proteção, dois clientes poderiam tentar atualizar o lance simultaneamente e provocar uma **race condition**.
 
-O registro de clientes também possui seu próprio mutex, pois várias threads podem inserir, remover ou consultar usuários ao mesmo tempo.
+O registro de clientes também possui seu próprio mutex, pois várias threads podem inserir, remover ou consultar usuários ao mesmo tempo. O envio de mensagens usa travas individuais por cliente, evitando que um único envio bloqueie diretamente os demais sockets. A aceitação dos lances e a transmissão dos respectivos eventos são serializadas para preservar a ordem das notificações.
+
+Os envios possuem tempo limite de 500 ms por chamada bloqueante, evitando esperas indefinidas com clientes que param de receber. Como o broadcast percorre os destinatários, um cliente lento ainda pode causar um atraso limitado nas notificações seguintes.
 
 ---
 
@@ -295,7 +300,8 @@ SocketAuction/
     ├── test_m5_concurrency.sh
     ├── test_m6_broadcast.sh
     ├── test_m7_history.sh
-    └── test_m8_robustness.sh
+    ├── test_m8_robustness.sh
+    └── test_connection_edges.py
 ```
 
 ---
@@ -355,7 +361,7 @@ Saída esperada:
 
 ```text
 [SERVER] SocketAuction listening on port 8080.
-[SERVER] M8: hardened protocol and graceful shutdown enabled.
+[SERVER] Ready to accept connections.
 ```
 
 ### 2. Abrir um cliente
@@ -436,7 +442,7 @@ Quando uma conexão é encerrada, o servidor:
 
 ### SIGPIPE
 
-O servidor ignora `SIGPIPE`. Assim, uma tentativa de envio para um cliente que acabou de se desconectar não encerra todo o processo servidor.
+O servidor ignora `SIGPIPE`. Assim, uma tentativa de envio para um cliente que acabou de se desconectar não encerra todo o processo servidor. Também foi configurado um tempo limite para chamadas bloqueantes de envio. Uma falha no broadcast provoca o fechamento da conexão problemática.
 
 ### Mensagens muito grandes
 
@@ -446,7 +452,7 @@ Uma linha maior que o limite aceito pelo protocolo é completamente consumida pe
 ERROR|MESSAGE_TOO_LONG|Command exceeds maximum size
 ```
 
-A próxima mensagem continua sendo interpretada normalmente.
+A próxima mensagem continua sendo interpretada normalmente. Se a conexão terminar antes de receber `\n`, o comando incompleto é descartado sem execução.
 
 ### Comandos inválidos
 
@@ -458,7 +464,7 @@ ERROR|UNKNOWN_COMMAND|Unknown command
 
 ### Encerramento do servidor
 
-`SIGINT` e `SIGTERM` são tratados para fechar o socket de escuta e encerrar o servidor de maneira controlada.
+`SIGINT` e `SIGTERM` interrompem a aceitação de novas conexões. O servidor fecha o socket de escuta, desativa a comunicação das sessões ativas e aguarda que as threads liberem seus recursos. O cliente também detecta o fechamento remoto e termina sem exigir que o usuário digite `QUIT`.
 
 ---
 
@@ -510,7 +516,17 @@ Verifica:
 - disponibilidade do servidor após erros;
 - encerramento controlado.
 
+### Testes adicionais de conexão e concorrência
+
+Os testes complementares, escritos com a biblioteca padrão do Python 3, reproduzem os problemas identificados na revisão: comandos TCP incompletos e linhas vazias, encerramento de clientes ativos e ainda não autenticados e ordem dos eventos sob concorrência.
+
+```bash
+make test-edges
+```
+
 ### Executar todos os testes
+
+Para executar a suíte completa, é necessário ter `bash` e `python3` instalados. A aplicação não depende de Python para compilar ou funcionar.
 
 ```bash
 make test-all
@@ -523,6 +539,7 @@ Resultado esperado:
 [PASS] M6 real-time broadcast test completed
 [PASS] M7 history/refinement test completed
 [PASS] M8 robustness test completed
+Ran 4 tests ... OK
 ```
 
 ---
@@ -575,7 +592,7 @@ Durante a demonstração é possível mostrar:
 - [Arquitetura](docs/ARCHITECTURE.md)
 - [Protocolo](docs/PROTOCOL.md)
 - [Plano de testes](docs/TEST_PLAN.md)
-- [Fluxo de desenvolvimento](docs/DEVELOPMENT.md)
+- [Manutenção e validação](docs/DEVELOPMENT.md)
 
 ---
 
@@ -617,4 +634,4 @@ Durante a demonstração é possível mostrar:
 - [x] Makefile
 - [x] Documentação
 
-O projeto encontra-se funcional e pronto para demonstração, restando apenas completar o sobrenome e o NUSP de Ana Beatriz antes da entrega final.
+A implementação passou pelos testes automatizados descritos acima. Antes de enviar a versão final, ainda é necessário confirmar o sobrenome completo e o NUSP de Ana Beatriz e executar a demonstração no ambiente de apresentação.

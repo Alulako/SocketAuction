@@ -1,117 +1,65 @@
-# Test plan — SocketAuction
+# Plano de testes
 
-## M1
+Os testes automatizados são executados em Linux e usam `make`, Bash e, para os testes complementares, Python 3. Os testes escritos em Python utilizam apenas a biblioteca padrão e não são dependências da aplicação.
 
-- [x] Server starts on the selected port.
-- [x] Client connects locally.
-- [x] PING receives PONG.
-- [x] STATUS returns the initial auction state.
-- [x] LOGIN returns a confirmation.
-- [x] QUIT closes the session.
-- [x] Unknown commands return an error.
-- [x] Client handles an unavailable server.
-
-## M2 — multiple clients
-
-- [x] 2 clients can stay connected at once.
-- [x] 5 clients can stay connected at once.
-
-## M3 — login and connected-user registry
-
-- [x] Successful login registers the username.
-- [x] `USERS` returns all currently logged-in users.
-- [x] Duplicate usernames are rejected while the first user is connected.
-- [x] A connection cannot log in twice.
-- [x] `USERS` is rejected before login.
-- [x] Username is released after `QUIT`.
-- [x] Username is released when the client closes the connection without `QUIT`.
-
-## M4 — bids and validation
-
-- [x] Bidding before login is rejected.
-- [x] Non-numeric bid is rejected.
-- [x] Bid equal to the current bid is rejected.
-- [x] Bid below the current bid is rejected.
-- [x] Valid bid above the current value is accepted.
-- [x] Accepted bid updates `STATUS`.
-- [x] Auction state is shared across different clients.
-- [x] Highest bidder changes when another user places a higher bid.
-
-## M5 — concurrent bids
-
-- [x] Auction compare-and-update is protected by a dedicated mutex.
-- [x] 20 clients can submit bids in the same time window.
-- [x] The final bid is the global maximum after concurrent updates.
-- [x] The final highest bidder matches the owner of the maximum bid.
-- [x] Stress test passes for 5 consecutive rounds.
-
-Run with:
-
-```bash
-make test-m5
-```
-
-## M6 — real-time broadcast
-
-- [x] Bidder receives `BID_ACCEPTED`.
-- [x] Another logged-in client receives `EVENT|NEW_BID` without issuing a command.
-- [x] Client receiver thread can receive asynchronous server messages while the main thread handles user input.
-- [x] Concurrent server writes are serialized.
-- [x] Server ignores `SIGPIPE`, so a disconnected client does not terminate the process during broadcast.
-- [x] M5 concurrency test still passes after broadcast was introduced.
-
-Run with:
-
-```bash
-make test-m6
-```
-
-## M7 — history and state synchronization
-
-- [x] `HISTORY` requires login.
-- [x] New clients receive the current auction state automatically after login.
-- [x] Accepted bids are stored in chronological order.
-- [x] Rejected bids are not stored in history.
-- [x] History is shared across different clients.
-- [x] M5 and M6 regression tests still pass after M7 changes.
-
-Run with:
-
-```bash
-make test-m7
-```
-
-## M8 — robustness and final regression
-
-- [x] Oversized protocol line returns `ERROR|MESSAGE_TOO_LONG`.
-- [x] Server drains an oversized line and correctly parses the next command.
-- [x] Abrupt disconnect unregisters the user.
-- [x] Malformed bids and unknown commands do not crash the server.
-- [x] Server accepts fresh clients after failure scenarios.
-- [x] `SIGTERM` performs graceful listener shutdown.
-- [x] Full M5-M8 regression suite passes.
-
-Run M8 only:
-
-```bash
-make test-m8
-```
-
-Run all automated tests:
-
-```bash
-make test-all
-```
-
-## Build validation
+## Compilação
 
 ```bash
 make clean
 make
 ```
 
-Compiler flags:
+A compilação utiliza `-std=c11 -Wall -Wextra -Wpedantic -O2 -pthread`.
 
-```text
--std=c11 -Wall -Wextra -Wpedantic
+## Concorrência de lances
+
+```bash
+make test-m5
 ```
+
+Abre 20 clientes na mesma janela de tempo por rodada, envia lances concorrentes e verifica o maior lance e seu ofertante ao final. O cenário é repetido cinco vezes.
+
+## Notificações assíncronas
+
+```bash
+make test-m6
+```
+
+Mantém um usuário conectado como observador e verifica que ele recebe o evento `EVENT|NEW_BID` quando outro usuário envia um lance aceito.
+
+## Histórico e sincronização inicial
+
+```bash
+make test-m7
+```
+
+Valida a consulta ao histórico, a ausência de lances rejeitados e o envio do estado atual do leilão após o login.
+
+## Tratamento de falhas
+
+```bash
+make test-m8
+```
+
+Verifica mensagens acima do limite do protocolo, recuperação após entrada inválida, desconexão abrupta, continuidade do atendimento e encerramento do servidor.
+
+## Testes complementares de conexão
+
+```bash
+make test-edges
+```
+
+O arquivo `tests/test_connection_edges.py` cobre situações encontradas na revisão técnica:
+
+1. Uma linha TCP sem `\n`, seguida de EOF, não deve ser executada, mesmo quando contém um comando ou lance aparentemente válido. Linhas vazias retornam erro sem fechar a conexão.
+2. O cliente deve terminar após o encerramento do servidor, ainda que sua entrada padrão permaneça aberta e o usuário não digite mais nada. O servidor deve fechar também conexões de clientes ainda não autenticados.
+3. O servidor deve encerrar conexões ainda não autenticadas ao receber `SIGINT`.
+4. Sob lances concorrentes, as notificações recebidas por um observador devem seguir a ordem dos lances aceitos, e o estado final deve conter o maior valor.
+
+## Suíte completa
+
+```bash
+make test-all
+```
+
+Também é recomendado demonstrar manualmente duas ou mais sessões simultâneas em terminais separados e, quando possível, verificar a comunicação entre máquinas diferentes na mesma rede.
