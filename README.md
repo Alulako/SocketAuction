@@ -15,10 +15,8 @@
 ## Integrantes
 
 - **Ana Luíza Lasta Kodama** — NUSP 14651204
-- **Ana Beatriz** — sobrenome completo e NUSP a confirmar
+- **Ana Beatriz Araujo Ferreira** — NUSP 12678044
 - **Isabela Lima Silva** — NUSP 15678780
-
-> **Pendente antes da entrega:** confirmar e preencher o sobrenome completo e o NUSP de Ana Beatriz.
 
 ---
 
@@ -634,4 +632,4 @@ Durante a demonstração é possível mostrar:
 - [x] Makefile
 - [x] Documentação
 
-A implementação passou pelos testes automatizados descritos acima. Antes de enviar a versão final, ainda é necessário confirmar o sobrenome completo e o NUSP de Ana Beatriz e executar a demonstração no ambiente de apresentação.
+A implementação passou pelos testes automatizados descritos acima. Antes da apresentação, recomenda-se executar uma demonstração completa no ambiente que será utilizado.
